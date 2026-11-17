@@ -8,7 +8,7 @@ import numpy as np
 import wandb
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
-from transformers import GenerationConfig
+from transformers import GenerationConfig, T5TokenizerFast
 from load_data import load_t5_data
 from utils import compute_metrics, save_queries_and_records
 
@@ -27,16 +27,16 @@ def get_args():
     # Training hyperparameters
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
-    parser.add_argument('--learning_rate', type=float, default=1e-1)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0)
 
     parser.add_argument('--scheduler_type', type=str, default="cosine", choices=["none", "cosine", "linear"],
                         help="Whether to use a LR scheduler and what type to use if so")
     parser.add_argument('--num_warmup_epochs', type=int, default=0,
                         help="How many epochs to warm up the learning rate for if using a scheduler")
-    parser.add_argument('--max_n_epochs', type=int, default=0,
+    parser.add_argument('--max_n_epochs', type=int, default=20,
                         help="How many epochs to train the model for")
-    parser.add_argument('--patience_epochs', type=int, default=0,
+    parser.add_argument('--patience_epochs', type=int, default=5,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
 
     parser.add_argument('--use_wandb', action='store_true',
@@ -130,24 +130,95 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
         
 def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
     '''
-    You must implement the evaluation loop to be using during training. We recommend keeping track
-    of the model loss on the SQL queries, the metrics compute_metrics returns (save_queries_and_records should be helpful)
-    and the model's syntax error rate. 
-
-    To compute non-loss metrics, you will need to perform generation with the model. Greedy decoding or beam search
-    should both provide good results. If you find that this component of evaluation takes too long with your compute,
-    we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
+    Evaluation loop: computes cross-entropy loss (teacher forcing) and generates SQL
+    queries autoregressively to compute Record F1, Record EM, SQL EM, and error rate.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
+    total_loss = 0
+    total_tokens = 0
+    criterion = nn.CrossEntropyLoss()
+    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+    all_generated_queries = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, initial_decoder_inputs in tqdm(dev_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            decoder_input = decoder_input.to(DEVICE)
+            decoder_targets = decoder_targets.to(DEVICE)
+
+            # Teacher-forcing loss
+            logits = model(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                decoder_input_ids=decoder_input,
+            )['logits']
+
+            non_pad = decoder_targets != PAD_IDX
+            if non_pad.sum() > 0:
+                loss = criterion(logits[non_pad], decoder_targets[non_pad])
+                num_tokens = non_pad.sum().item()
+                total_loss += loss.item() * num_tokens
+                total_tokens += num_tokens
+
+            # Autoregressive generation for metric computation
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                max_new_tokens=256,
+            )
+            for gen_ids in generated_ids:
+                query = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                all_generated_queries.append(query)
+
+    avg_loss = total_loss / max(total_tokens, 1)
+
+    sql_dir = os.path.dirname(model_sql_path)
+    if sql_dir:
+        os.makedirs(sql_dir, exist_ok=True)
+    record_dir = os.path.dirname(model_record_path)
+    if record_dir:
+        os.makedirs(record_dir, exist_ok=True)
+
+    save_queries_and_records(all_generated_queries, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, error_msgs = compute_metrics(
+        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    )
+    error_rate = sum(1 for msg in error_msgs if msg) / max(len(error_msgs), 1)
+
+    return avg_loss, record_f1, record_em, sql_em, error_rate
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
-    You must implement inference to compute your model's generated SQL queries and its associated 
-    database records. Implementation should be very similar to eval_epoch.
+    Inference on the test set: generate SQL queries autoregressively and save them
+    along with their associated database records for submission.
     '''
-    pass
+    model.eval()
+    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+    all_generated_queries = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, initial_decoder_inputs in tqdm(test_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                max_new_tokens=256,
+            )
+            for gen_ids in generated_ids:
+                query = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                all_generated_queries.append(query)
+
+    sql_dir = os.path.dirname(model_sql_path)
+    if sql_dir:
+        os.makedirs(sql_dir, exist_ok=True)
+    record_dir = os.path.dirname(model_record_path)
+    if record_dir:
+        os.makedirs(record_dir, exist_ok=True)
+
+    save_queries_and_records(all_generated_queries, model_sql_path, model_record_path)
 
 def main():
     # Get key arguments

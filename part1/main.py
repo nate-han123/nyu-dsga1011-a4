@@ -40,12 +40,16 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
     ################################
     ##### YOUR CODE BEGINGS HERE ###
 
-    # Implement the training loop --- make sure to use the optimizer and lr_sceduler (learning rate scheduler)
-    # Remember that pytorch uses gradient accumumlation so you need to use zero_grad (https://pytorch.org/tutorials/recipes/recipes/zeroing_out_gradients.html)
-    # You can use progress_bar.update(1) to see the progress during training
-    # You can refer to the pytorch tutorial covered in class for reference
-
-    raise NotImplementedError
+    for epoch in range(num_epochs):
+        for batch in train_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            progress_bar.update(1)
 
     ##### YOUR CODE ENDS HERE ######
 
@@ -89,11 +93,25 @@ def create_augmented_dataloader(args, dataset):
     ################################
     ##### YOUR CODE BEGINGS HERE ###
 
-    # Here, 'dataset' is the original dataset. You should return a dataloader called 'train_dataloader' -- this
-    # dataloader will be for the original training split augmented with 5k random transformed examples from the training set.
-    # You may find it helpful to see how the dataloader was created at other place in this code.
+    from datasets import concatenate_datasets
 
-    raise NotImplementedError
+    train_data = dataset["train"]
+
+    # Sample 5000 random training examples and apply the transformation
+    augment_indices = random.sample(range(len(train_data)), 5000)
+    augment_subset = train_data.select(augment_indices)
+    transformed_subset = augment_subset.map(custom_transform, load_from_cache_file=False)
+
+    # Combine original training data with the 5k transformed examples
+    augmented_data = concatenate_datasets([train_data, transformed_subset])
+
+    # Tokenize and prepare the augmented dataset
+    augmented_tokenized = augmented_data.map(tokenize_function, batched=True, load_from_cache_file=False)
+    augmented_tokenized = augmented_tokenized.remove_columns(["text"])
+    augmented_tokenized = augmented_tokenized.rename_column("label", "labels")
+    augmented_tokenized.set_format("torch")
+
+    train_dataloader = DataLoader(augmented_tokenized, shuffle=True, batch_size=args.batch_size)
 
     ##### YOUR CODE ENDS HERE ######
 
@@ -158,7 +176,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
 
     # Tokenize the dataset
-    dataset = load_dataset("imdb")
+    dataset = load_dataset("stanfordnlp/imdb")
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
     # Prepare dataset for use by model
