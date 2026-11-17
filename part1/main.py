@@ -50,6 +50,7 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
             lr_scheduler.step()
             optimizer.zero_grad()
             progress_bar.update(1)
+        model.save_pretrained(os.path.join(save_dir, f"checkpoint_epoch{epoch}"))
 
     ##### YOUR CODE ENDS HERE ######
 
